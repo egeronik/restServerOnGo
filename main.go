@@ -1,42 +1,22 @@
 package main
 
 import (
-	"errors"
+	"context"
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
+	"os"
+	"path"
+	"strconv"
+	"time"
 )
 
-type path struct {
-	queue  string
-	args   []string
-	values []string
-}
+// Возможно следовало написать кастомную структуру содержащую и канал и реальную очередь
+// В таком случае функционала было бы значительно больше, но поскольку в задании не указанно подобного
+// То обошелся обычным каналом строк
+var qs map[string]chan string
 
-var qs map[string][]string
-
-func createPath(origin string) (path, error) {
-	ans := path{}
-	pos := strings.Index(origin, "?")
-	if pos <= -1 {
-		ans.queue = origin
-		return ans, nil
-	}
-	ans.queue = origin[:pos]
-	split := strings.Split(origin[pos+1:], "&")
-	for _, s := range split {
-		tempos := strings.Index(s, "=")
-		if tempos <= -1 {
-			return ans, errors.New("Incorrect arguments")
-		}
-		ans.args = append(ans.args, s[:tempos])
-		ans.values = append(ans.values, s[tempos+1:])
-	}
-
-	return ans, nil
-
-}
+var defaultTimeout int = 30
 
 func defaultHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
@@ -54,44 +34,55 @@ func defaultHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	for key, m := range qs {
-		fmt.Println("Queue:", key)
-		for k, v := range m {
-			fmt.Println("	", k, "value is", v)
-		}
-	}
+
 }
 
 func getFromQueue(w http.ResponseWriter, r *http.Request) {
 	if r.ParseForm() != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		_, err := w.Write(nil)
+		//Probably redundant code, but who cares
 		if err != nil {
 			return
 		}
 		return
 	}
-	req, _ := createPath(r.RequestURI[1:])
-	if val, ok := qs[req.queue]; ok && len(val) > 0 {
-		w.WriteHeader(http.StatusOK)
-		_, err := w.Write([]byte(val[0]))
-		if err != nil {
-			return
-		}
-		qs[req.queue] = val[1:]
-	} else {
+
+	timeout, _ := strconv.Atoi(r.Form.Get("timeout"))
+	if timeout == 0 || timeout > 600 {
+		timeout = defaultTimeout
+	}
+
+	ctxTimeout, cancel := context.WithTimeout(context.Background(), time.Second*time.Duration(timeout))
+	defer cancel()
+
+	queueName := path.Base(r.URL.Path)
+	if _, exists := qs[queueName]; !exists {
+		qs[queueName] = make(chan string)
+	}
+
+	select {
+	//Wait until timeout
+	case <-ctxTimeout.Done():
 		w.WriteHeader(http.StatusNotFound)
 		_, err := w.Write(nil)
 		if err != nil {
 			return
 		}
+	//Parse data from channel
+	case result := <-qs[queueName]:
+		w.WriteHeader(http.StatusOK)
+		_, err := w.Write([]byte(result))
+		if err != nil {
+			return
+		}
 	}
+
 }
 
-// curl -XPUT http://localhost:10000/color?v=red
 func putInQueue(w http.ResponseWriter, r *http.Request) {
 
-	req, _ := createPath(r.RequestURI[1:])
+	//Check for correct request form
 	if r.ParseForm() != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		_, err := w.Write(nil)
@@ -100,13 +91,29 @@ func putInQueue(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
+	queueName := path.Base(r.URL.Path)
+
+	//Check for correct request args
 	if v := r.Form.Get("v"); v != "" {
-		qs[req.queue] = append(qs[req.queue], v)
+
+		//Run in goroutine because channel doesn't allow func to end
+		go func() {
+			if q, exists := qs[queueName]; exists {
+				q <- v
+			} else {
+				//Else create queue
+				qs[queueName] = make(chan string)
+				qs[queueName] <- v
+			}
+		}()
+		//If queue already exists just put new elem
 		w.WriteHeader(http.StatusOK)
 		_, err := w.Write(nil)
 		if err != nil {
 			return
 		}
+
 	} else {
 		w.WriteHeader(http.StatusBadRequest)
 		_, err := w.Write(nil)
@@ -117,12 +124,23 @@ func putInQueue(w http.ResponseWriter, r *http.Request) {
 
 }
 
-func handleRequests() {
-	http.HandleFunc("/", defaultHandler)          //Регистрирует хендлер для short-hand клиента
-	log.Fatal(http.ListenAndServe(":10000", nil)) //Запускает сам short-hand клиент
+func handleRequests(port string) {
+	if port == "" {
+		port = ":10000"
+	} else {
+		port = ":" + port
+	}
+	println("Started with port:", port[1:])
+	http.HandleFunc("/", defaultHandler)      //Регистрирует хендлер для short-hand клиента
+	log.Fatal(http.ListenAndServe(port, nil)) //Запускает сам short-hand клиент
 }
 
 func main() {
-	qs = make(map[string][]string)
-	handleRequests()
+	qs = make(map[string]chan string)
+	if len(os.Args) > 1 {
+		handleRequests(os.Args[1])
+	} else {
+		handleRequests("")
+	}
+
 }
